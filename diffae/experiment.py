@@ -6,7 +6,8 @@ import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
 import torch
-from numpy.lib.function_base import flip
+#from numpy.lib.function_base import flip
+from numpy.lib._function_base_impl import flip
 from pytorch_lightning import loggers as pl_loggers
 from pytorch_lightning.callbacks import *
 from torch import nn
@@ -24,6 +25,24 @@ from .metrics import *
 from .renderer import *
 
 
+class SizedIterableWrapper:
+    # The constructor accepts a dataloader and a length.
+    # 'dataloader' can be any iterable (like a list, generator, etc.),
+    # and 'length' represents the total number of items it is supposed to yield.
+    def __init__(self, dataloader, length):
+        self.dataloader = dataloader  # Store the provided dataloader
+        self._length = length  # Store the provided length
+
+    # The __iter__ method makes the object iterable.
+    # It returns an iterator for the wrapped dataloader.
+    def __iter__(self):
+        return iter(self.dataloader)
+
+    # The __len__ method returns the stored length.
+    # This is useful when you need to know how many items the dataloader should yield.
+    def __len__(self):
+        return self._length
+
 class LitModel(pl.LightningModule):
     def __init__(self, conf: TrainConfig):
         super().__init__()
@@ -35,22 +54,29 @@ class LitModel(pl.LightningModule):
 
         self.conf = conf
 
+        # Initialize the model based on configuration
         self.model = conf.make_model_conf().make_model()
-        self.ema_model = copy.deepcopy(self.model)
-        self.ema_model.requires_grad_(False)
-        self.ema_model.eval()
 
+        # Create an Exponential Moving Average (EMA) copy of the model
+        # EMA models typically produce higher quality samples
+        self.ema_model = copy.deepcopy(self.model)
+        self.ema_model.requires_grad_(False) # No gradients for EMA model
+        self.ema_model.eval() # Always in evaluation mode
+
+        # Print model size (number of parameters)
         model_size = 0
         for param in self.model.parameters():
             model_size += param.data.nelement()
         print('Model params: %.2f M' % (model_size / 1024 / 1024))
 
+        # Set up diffusion samplers for training and evaluation
         self.sampler = conf.make_diffusion_conf().make_sampler()
         self.eval_sampler = conf.make_eval_diffusion_conf().make_sampler()
 
-        # this is shared for both model and latent
+        # Timestep sampler (shared between model and latent diffusion)
         self.T_sampler = conf.make_T_sampler()
 
+        # Set up latent diffusion samplers if using a latent network
         if conf.train_mode.use_latent_net():
             self.latent_sampler = conf.make_latent_diffusion_conf(
             ).make_sampler()
@@ -60,19 +86,33 @@ class LitModel(pl.LightningModule):
             self.latent_sampler = None
             self.eval_latent_sampler = None
 
-        # initial variables for consistent sampling
+        # Register a fixed noise buffer for consistent sampling during evaluation
+        # This ensures samples are comparable across training iterations
         self.register_buffer(
             'x_T',
             torch.randn(conf.sample_size, 3, conf.img_size, conf.img_size))
 
-        if conf.pretrain is not None:
-            print(f'loading pretrain ... {conf.pretrain.name}')
-            state = torch.load(conf.pretrain.path, map_location='cpu')
-            print('step:', state['global_step'])
+        #if conf.pretrain is not None:
+        #    print(f'loading pretrain ... {conf.pretrain.name}')
+        #    state = torch.load(conf.pretrain.path, map_location='cpu')
+        #    print('step:', state['global_step'])
+        #    self.load_state_dict(state['state_dict'], strict=False)
+
+        if conf.pretrain is not None:  # Check if a pretrain configuration is provided
+            print(
+                f'loading pretrain ... {conf.pretrain.name}')  # Print the name of the pretrain configuration being loaded
+            # Load the saved model state from the provided path.
+            # 'map_location' is set to 'cpu' to move the loaded tensors to CPU.
+            # 'weights_only=False' ensures the full state (not just the model weights) is loaded.
+            state = torch.load(conf.pretrain.path, map_location='cpu', weights_only=False)
+            print('step:', state['global_step'])  # Print the current global step from the loaded checkpoint state
+            # Load the state dictionary into the model.
+            # 'strict=False' allows for some keys in the model's state dict to be missing or extra.
             self.load_state_dict(state['state_dict'], strict=False)
 
         if conf.latent_infer_path is not None:
             print('loading latent stats ...')
+            # same here, loading stuff
             state = torch.load(conf.latent_infer_path)
             self.conds = state['conds']
             self.register_buffer('conds_mean', state['conds_mean'][None, :])
@@ -82,38 +122,65 @@ class LitModel(pl.LightningModule):
             self.conds_std = None
 
     def normalize(self, cond):
+        """
+        Normalize conditional latent vectors using precomputed statistics.
+
+        This standardizes latent vectors to zero mean and unit variance.
+        """
         cond = (cond - self.conds_mean.to(self.device)) / self.conds_std.to(
             self.device)
         return cond
 
     def denormalize(self, cond):
+        """
+        Denormalize conditional latent vectors back to their original scale.
+
+        This reverses the normalization process for generation or visualization.
+        """
         cond = (cond * self.conds_std.to(self.device)) + self.conds_mean.to(
             self.device)
         return cond
 
     def sample(self, N, device, T=None, T_latent=None):
+        """
+        Generate new images using the diffusion model.
+
+        Args:
+            N: Number of samples to generate
+            device: Device to generate on
+            T: Optional override for number of diffusion steps
+            T_latent: Optional override for number of latent diffusion steps
+
+        Returns:
+            Tensor of generated images in [0,1] range
+        """
+
+        # Choose samplers based on whether custom timestep counts are provided
         if T is None:
             sampler = self.eval_sampler
             latent_sampler = self.latent_sampler
         else:
+            # Create new samplers with the specified number of timesteps
             sampler = self.conf._make_diffusion_conf(T).make_sampler()
             latent_sampler = self.conf._make_latent_diffusion_conf(T_latent).make_sampler()
 
+        # Generate random noise as starting point for sampling
         noise = torch.randn(N,
                             3,
                             self.conf.img_size,
                             self.conf.img_size,
                             device=device)
+        # Generate images through the unconditioned diffusion process
         pred_img = render_uncondition(
             self.conf,
-            self.ema_model,
-            noise,
-            sampler=sampler,
-            latent_sampler=latent_sampler,
-            conds_mean=self.conds_mean,
+            self.ema_model, # Use the EMA model for better quality
+            noise, # Starting noise
+            sampler=sampler,  # Pixel-space diffusion sampler
+            latent_sampler=latent_sampler, # Latent-space diffusion sampler
+            conds_mean=self.conds_mean,  # Statistics for latent normalization
             conds_std=self.conds_std,
         )
-        pred_img = (pred_img + 1) / 2
+        pred_img = (pred_img + 1) / 2 # Convert from [-1,1] to [0,1] range for visualization
         return pred_img
 
     def render(self, noise, cond=None, T=None):
@@ -183,47 +250,117 @@ class LitModel(pl.LightningModule):
         self.val_data = self.train_data
         print('val data:', len(self.val_data))
 
+    # def _train_dataloader(self, drop_last=True):
+    #     """
+    #     really make the dataloader
+    #     """
+    #     # make sure to use the fraction of batch size
+    #     # the batch size is global!
+    #     conf = self.conf.clone()
+    #     conf.batch_size = self.batch_size
+    #
+    #     dataloader = conf.make_loader(self.train_data,
+    #                                   shuffle=True,
+    #                                   drop_last=drop_last)
+    #     return dataloader
+
     def _train_dataloader(self, drop_last=True):
         """
-        really make the dataloader
-        """
-        # make sure to use the fraction of batch size
-        # the batch size is global!
+           Really make the dataloader.
+           """
+        if not hasattr(self, "train_data"):
+            self.setup('fit')
+        if not hasattr(self, "train_data"):
+            raise ValueError(
+                "train_data is not initialized even after setup() call. Please ensure setup() properly initializes train_data."
+            )
+
+        # Clone the configuration and set the correct batch size.
         conf = self.conf.clone()
         conf.batch_size = self.batch_size
 
-        dataloader = conf.make_loader(self.train_data,
-                                      shuffle=True,
-                                      drop_last=drop_last)
+        # Create a DataLoader directly instead of make loader, picke issues and multiprocessing
+        dataloader = torch.utils.data.DataLoader(
+            self.train_data,
+            batch_size=conf.batch_size,
+            shuffle=True,
+            drop_last=drop_last,
+            num_workers=0,  # Use 0 on Windows to avoid pickling issues.
+            persistent_workers=False
+        )
         return dataloader
+
+    # def train_dataloader(self):
+    #    """
+    #    return the dataloader, if diffusion mode => return image dataset
+    #   if latent mode => return the inferred latent dataset
+    #    """
+    #    print('on train dataloader start ...')
+    #    if self.conf.train_mode.require_dataset_infer():
+    #         if self.conds is None:
+    #            # usually we load self.conds from a file
+    #            # so we do not need to do this again!
+    #            self.conds = self.infer_whole_dataset()
+    #            # need to use float32! unless the mean & std will be off!
+    #            # (1, c)
+    #            self.conds_mean.data = self.conds.float().mean(dim=0,
+    #                                                           keepdim=True)
+    #            self.conds_std.data = self.conds.float().std(dim=0,
+    #                                                          keepdim=True)
+    #        print('mean:', self.conds_mean.mean(), 'std:',
+    #              self.conds_std.mean())
+    #
+    #        # return the dataset with pre-calculated conds
+    #        conf = self.conf.clone()
+    #        conf.batch_size = self.batch_size
+    #        data = TensorDataset(self.conds)
+    #        return conf.make_loader(data, shuffle=True)
+    #    else:
+    #        return self._train_dataloader()
 
     def train_dataloader(self):
         """
-        return the dataloader, if diffusion mode => return image dataset
-        if latent mode => return the inferred latent dataset
+        Return the dataloader:
+              - If in diffusion mode, return an image dataset.
+              - If in latent mode, return the inferred latent dataset.
         """
         print('on train dataloader start ...')
-        if self.conf.train_mode.require_dataset_infer():
-            if self.conds is None:
-                # usually we load self.conds from a file
-                # so we do not need to do this again!
-                self.conds = self.infer_whole_dataset()
-                # need to use float32! unless the mean & std will be off!
-                # (1, c)
-                self.conds_mean.data = self.conds.float().mean(dim=0,
-                                                               keepdim=True)
-                self.conds_std.data = self.conds.float().std(dim=0,
-                                                             keepdim=True)
-            print('mean:', self.conds_mean.mean(), 'std:',
-                  self.conds_std.mean())
 
-            # return the dataset with pre-calculated conds
-            conf = self.conf.clone()
-            conf.batch_size = self.batch_size
-            data = TensorDataset(self.conds)
-            return conf.make_loader(data, shuffle=True)
+        # Check if the current training mode requires dataset inference.
+        if self.conf.train_mode.require_dataset_infer():
+                # If conditions (self.conds) are not already available, compute them.
+                if self.conds is None:
+                    # Infer and set the complete dataset conditions.
+                    # Typically, self.conds might be loaded from a file, avoiding re-computation.
+                    self.conds = self.infer_whole_dataset()
+
+                    # Compute the mean of conditions as float32 to prevent precision issues.
+                    # This is done along dimension 0, preserving the dimension for later operations.
+                    self.conds_mean.data = self.conds.float().mean(dim=0, keepdim=True)
+
+                    # Compute the standard deviation of conditions as float32.
+                    self.conds_std.data = self.conds.float().std(dim=0, keepdim=True)
+
+                # Log the mean and standard deviation values for verification.
+                print('mean:', self.conds_mean.mean(), 'std:', self.conds_std.mean())
+
+                # Clone the current configuration to avoid modifying the original.
+                conf = self.conf.clone()
+
+                # Set the batch size in the cloned configuration.
+                conf.batch_size = self.batch_size
+
+                # Create a TensorDataset from the inferred conditions.
+                data = TensorDataset(self.conds)
+
+                # Use the configuration to create a data loader with shuffling enabled.
+                loader = conf.make_loader(data, shuffle=True)
+
+                # Return a wrapped loader that includes the explicit length of the dataset.
+                return SizedIterableWrapper(loader, len(data)) # PyLightning stuff
         else:
-            return self._train_dataloader()
+                # If dataset inference isn't required, use the default training dataloader.
+                return self._train_dataloader()
 
     @property
     def batch_size(self):
@@ -246,7 +383,8 @@ class LitModel(pl.LightningModule):
     def is_last_accum(self, batch_idx):
         """
         is it the last gradient accumulation loop? 
-        used with gradient_accum > 1 and to see if the optimizer will perform "step" in this iteration or not
+        used with gradient_accum > 1 and to see if the optimizer will
+        perform "step" in this iteration or not
         """
         return (batch_idx + 1) % self.conf.accum_batches == 0
 
@@ -255,13 +393,17 @@ class LitModel(pl.LightningModule):
                             T_render=None,
                             render_save_path=None):
         """
-        predicting the latents given images using the encoder
+        Encode the entire dataset into latent representations using the model's encoder.
+
+        This is a crucial step for the second phase of training (latent diffusion),
+        where we need the latent codes for all training images.
 
         Args:
-            both_flips: include both original and flipped images; no need, it's not an improvement
-            with_render: whether to also render the images corresponding to that latent
-            render_save_path: lmdb output for the rendered images
+            with_render: Whether to also generate images from the latent codes
+            T_render: Number of diffusion timesteps for rendering
+            render_save_path: Path to save the rendered images in LMDB format
         """
+        # Set up the dataset with appropriate transforms
         data = self.conf.make_dataset()
         if isinstance(data, CelebAlmdb) and data.crop_d2c:
             # special case where we need the d2c crop
@@ -272,7 +414,7 @@ class LitModel(pl.LightningModule):
             data.transform = make_transform(self.conf.img_size, flip_prob=0)
 
         # data = SubsetDataset(data, 21)
-
+        # Create a data loader for efficient batch processing
         loader = self.conf.make_loader(
             data,
             shuffle=False,
@@ -280,69 +422,85 @@ class LitModel(pl.LightningModule):
             batch_size=self.conf.batch_size_eval,
             parallel=True,
         )
+
+        # Use the EMA model for more stable results
         model = self.ema_model
         model.eval()
         conds = []
 
+        # Set up rendering if requested
         if with_render:
+            # Create a sampler with specified or default evaluation timesteps
             sampler = self.conf._make_diffusion_conf(
                 T=T_render or self.conf.T_eval).make_sampler()
-
+            # Only the main process (rank 0) writes images to disk
             if self.global_rank == 0:
                 writer = LMDBImageWriter(render_save_path,
                                          format='webp',
                                          quality=100)
             else:
-                writer = nullcontext()
+                writer = nullcontext() # No-op for other processes
         else:
             writer = nullcontext()
 
+        # Process the entire dataset
         with writer:
             for batch in tqdm(loader, total=len(loader), desc='infer'):
                 with torch.no_grad():
                     # (n, c)
                     # print('idx:', batch['index'])
+                    # Encode images to latent space
                     cond = model.encoder(batch['img'].to(self.device))
 
                     # used for reordering to match the original dataset
+                    # Get indices for proper ordering
                     idx = batch['index']
-                    idx = self.all_gather(idx)
+                    idx = self.all_gather(idx)  # Gather indices from all processes
                     if idx.dim() == 2:
-                        idx = idx.flatten(0, 1)
-                    argsort = idx.argsort()
+                        idx = idx.flatten(0, 1) # Flatten distributed batch dimension
+                    argsort = idx.argsort() # Get ordering to match original dataset
 
+                    # Optionally render images from latent codes
                     if with_render:
+                        # Generate random noise as starting point
                         noise = torch.randn(len(cond),
                                             3,
                                             self.conf.img_size,
                                             self.conf.img_size,
                                             device=self.device)
+
+                        # Sample images using the diffusion model
                         render = sampler.sample(model, noise=noise, cond=cond)
-                        render = (render + 1) / 2
+                        render = (render + 1) / 2 # Convert from [-1,1] to [0,1] range
                         # print('render:', render.shape)
                         # (k, n, c, h, w)
+
+                        # Gather rendered images from all processes
                         render = self.all_gather(render)
                         if render.dim() == 5:
                             # (k*n, c)
-                            render = render.flatten(0, 1)
+                            render = render.flatten(0, 1) # Flatten distributed batch dimension
 
                         # print('global_rank:', self.global_rank)
-
+                        # Only the main process saves images
                         if self.global_rank == 0:
                             writer.put_images(render[argsort])
 
                     # (k, n, c)
+                    # Gather latent codes from all processes
                     cond = self.all_gather(cond)
 
                     if cond.dim() == 3:
                         # (k*n, c)
-                        cond = cond.flatten(0, 1)
+                        cond = cond.flatten(0, 1) # Flatten distributed batch dimension
 
+                    # Add to collection, ensuring correct ordering
                     conds.append(cond[argsort].cpu())
                 # break
-        model.train()
+        model.train() # Reset model to training mode
         # (N, c) cpu
 
+        # Concatenate all latent codes into a single tensor
         conds = torch.cat(conds).float()
         return conds
 
@@ -406,8 +564,46 @@ class LitModel(pl.LightningModule):
 
         return {'loss': loss}
 
-    def on_train_batch_end(self, outputs, batch, batch_idx: int,
-                           dataloader_idx: int) -> None:
+    #def on_train_batch_end(self, outputs, batch, batch_idx: int,
+    #                       dataloader_idx: int) -> None:
+    #    """
+    #    after each training step ...
+    #    """
+    #    if self.is_last_accum(batch_idx):
+    #        # only apply ema on the last gradient accumulation step,
+    #        # if it is the iteration that has optimizer.step()
+    #        if self.conf.train_mode == TrainMode.latent_diffusion:
+    #            # it trains only the latent hence change only the latent
+    #            ema(self.model.latent_net, self.ema_model.latent_net,
+    #                self.conf.ema_decay)
+    #        else:
+    #            ema(self.model, self.ema_model, self.conf.ema_decay)
+    #
+    #        # logging
+    #        if self.conf.train_mode.require_dataset_infer():
+    #           imgs = None
+    #        else:
+    #            imgs = batch['img']
+    #        self.log_sample(x_start=imgs)
+    #        self.evaluate_scores()
+
+    #def on_before_optimizer_step(self, optimizer: Optimizer,
+    #                             optimizer_idx: int) -> None:
+    #    # fix the fp16 + clip grad norm problem with pytorch lightinng
+    #    # this is the currently correct way to do it
+    #    if self.conf.grad_clip > 0:
+    #        # from trainer.params_grads import grads_norm, iter_opt_params
+    #        params = [
+    #            p for group in optimizer.param_groups for p in group['params']
+    #        ]
+    #        # print('before:', grads_norm(iter_opt_params(optimizer)))
+    #        torch.nn.utils.clip_grad_norm_(params,
+    #                                       max_norm=self.conf.grad_clip)
+    #        # print('after:', grads_norm(iter_opt_params(optimizer)))
+
+
+    # Change in PyLightning framework
+    def on_train_batch_end(self, outputs, batch, batch_idx: int) -> None:
         """
         after each training step ...
         """
@@ -429,19 +625,13 @@ class LitModel(pl.LightningModule):
             self.log_sample(x_start=imgs)
             self.evaluate_scores()
 
-    def on_before_optimizer_step(self, optimizer: Optimizer,
-                                 optimizer_idx: int) -> None:
-        # fix the fp16 + clip grad norm problem with pytorch lightinng
+    # Change in PyLightning framework
+    def on_before_optimizer_step(self, optimizer: Optimizer,**kwargs) -> None:
+        # fix the fp16 + clip grad norm problem with pytorch lightning
         # this is the currently correct way to do it
         if self.conf.grad_clip > 0:
-            # from trainer.params_grads import grads_norm, iter_opt_params
-            params = [
-                p for group in optimizer.param_groups for p in group['params']
-            ]
-            # print('before:', grads_norm(iter_opt_params(optimizer)))
-            torch.nn.utils.clip_grad_norm_(params,
-                                           max_norm=self.conf.grad_clip)
-            # print('after:', grads_norm(iter_opt_params(optimizer)))
+            params = [p for group in optimizer.param_groups for p in group['params']]
+            torch.nn.utils.clip_grad_norm_(params, max_norm=self.conf.grad_clip)
 
     def log_sample(self, x_start):
         """
@@ -670,15 +860,19 @@ class LitModel(pl.LightningModule):
 
     def test_step(self, batch, *args, **kwargs):
         """
-        for the "eval" mode. 
-        We first select what to do according to the "conf.eval_programs". 
-        test_step will only run for "one iteration" (it's a hack!).
+        Evaluation method that supports multiple evaluation protocols.
+
+        The method parses the 'eval_programs' configuration list to determine
+        which evaluations to run. Each program in the list specifies a different
+        evaluation task.
         
         We just want the multi-gpu support. 
         """
+        # Ensure proper seeding for reproducibility
         # make sure you seed each worker differently!
         self.setup()
 
+        # ============ LATENT INFERENCE EVALUATION ============
         # it will run only one step!
         print('global step:', self.global_step)
         """
@@ -687,41 +881,57 @@ class LitModel(pl.LightningModule):
         if 'infer' in self.conf.eval_programs:
             if 'infer' in self.conf.eval_programs:
                 print('infer ...')
+                # Run inference on the entire dataset
                 conds = self.infer_whole_dataset().float()
                 # NOTE: always use this path for the latent.pkl files
+                # Save latents to standardized path
                 save_path = f'checkpoints/{self.conf.name}/latent.pkl'
             else:
                 raise NotImplementedError()
 
+            # Only the main process (rank 0) saves the results
             if self.global_rank == 0:
+                # Calculate statistics of the latent space
                 conds_mean = conds.mean(dim=0)
                 conds_std = conds.std(dim=0)
+
+                # Create directory if needed
                 if not os.path.exists(os.path.dirname(save_path)):
                     os.makedirs(os.path.dirname(save_path))
+
+                # Save latents and their statistics
                 torch.save(
                     {
                         'conds': conds,
                         'conds_mean': conds_mean,
                         'conds_std': conds_std,
                     }, save_path)
+
+        # ============ LATENT INFERENCE WITH RENDERING ============
         """
         "infer+render" = predict the latent variables using the encoder on the whole dataset
         THIS ALSO GENERATE CORRESPONDING IMAGES
         """
         # infer + reconstruction quality of the input
+        # Program: "infer+render<T>" - Encode and also render the latents
         for each in self.conf.eval_programs:
             if each.startswith('infer+render'):
+                # Parse timestep parameter using regex
                 m = re.match(r'infer\+render([0-9]+)', each)
                 if m is not None:
                     T = int(m[1])
                     self.setup()
                     print(f'infer + reconstruction T{T} ...')
+
+                    # Run inference with rendering enabled
                     conds = self.infer_whole_dataset(
                         with_render=True,
                         T_render=T,
                         render_save_path=
                         f'latent_infer_render{T}/{self.conf.name}.lmdb',
                     )
+
+                    # Save results
                     save_path = f'latent_infer_render{T}/{self.conf.name}.pkl'
                     conds_mean = conds.mean(dim=0)
                     conds_std = conds.std(dim=0)
@@ -734,6 +944,7 @@ class LitModel(pl.LightningModule):
                             'conds_std': conds_std,
                         }, save_path)
 
+        # ============ FID EVALUATION ============
         # evals those "fidXX"
         """
         "fid<T>" = unconditional generation (conf.train_mode = diffusion).
@@ -744,14 +955,20 @@ class LitModel(pl.LightningModule):
         """
         for each in self.conf.eval_programs:
             if each.startswith('fid'):
+
+                # Check for pattern: fid(T1,T2) - for latent diffusion evaluation
                 m = re.match(r'fid\(([0-9]+),([0-9]+)\)', each)
                 clip_latent_noise = False
                 if m is not None:
+
+                    # Two timestep parameters: pixel diffusion and latent diffusion
                     # eval(T1,T2)
                     T = int(m[1])
                     T_latent = int(m[2])
                     print(f'evaluating FID T = {T}... latent T = {T_latent}')
                 else:
+
+                    # Check for pattern: fidclip(T1,T2) - with latent noise clipping
                     m = re.match(r'fidclip\(([0-9]+),([0-9]+)\)', each)
                     if m is not None:
                         # fidclip(T1,T2)
@@ -762,13 +979,17 @@ class LitModel(pl.LightningModule):
                             f'evaluating FID (clip latent noise) T = {T}... latent T = {T_latent}'
                         )
                     else:
+                        # Simple pattern: fidT - just pixel diffusion
                         # evalT
                         _, T = each.split('fid')
                         T = int(T)
                         T_latent = None
                         print(f'evaluating FID T = {T}...')
 
+                # Prepare data
                 self.train_dataloader()
+
+                # Create samplers with specified timesteps
                 sampler = self.conf._make_diffusion_conf(T=T).make_sampler()
                 if T_latent is not None:
                     latent_sampler = self.conf._make_latent_diffusion_conf(
@@ -776,8 +997,11 @@ class LitModel(pl.LightningModule):
                 else:
                     latent_sampler = None
 
+                # Set up evaluation configuration
                 conf = self.conf.clone()
-                conf.eval_num_images = 50_000
+                conf.eval_num_images = 50_000 # Standard FID sample size
+
+                # Calculate FID score
                 score = evaluate_fid(
                     sampler,
                     self.ema_model,
@@ -791,6 +1015,8 @@ class LitModel(pl.LightningModule):
                     remove_cache=False,
                     clip_latent_noise=clip_latent_noise,
                 )
+
+                # Log results with appropriate naming
                 if T_latent is None:
                     self.log(f'fid_ema_T{T}', score)
                 else:
@@ -802,6 +1028,10 @@ class LitModel(pl.LightningModule):
         """
         "recon<T>" = reconstruction & autoencoding (without noise inversion)
         """
+
+        # ============ RECONSTRUCTION EVALUATION ============
+
+        # Program: "recon<T>" - Evaluate autoencoding reconstruction quality
         for each in self.conf.eval_programs:
             if each.startswith('recon'):
                 self.model: BeatGANsAutoencModel
@@ -813,16 +1043,25 @@ class LitModel(pl.LightningModule):
 
                 conf = self.conf.clone()
                 # eval whole val dataset
+                # Evaluate on entire validation dataset
                 conf.eval_num_images = len(self.val_data)
                 # {'lpips', 'mse', 'ssim'}
+
+                # Calculate multiple metrics (LPIPS, MSE, SSIM)
                 score = evaluate_lpips(sampler,
                                        self.ema_model,
                                        conf,
                                        device=self.device,
                                        val_data=self.val_data,
                                        latent_sampler=None)
+
+                # Log each metric separately
                 for k, v in score.items():
                     self.log(f'{k}_ema_T{T}', v)
+
+        # ============ NOISE INVERSION EVALUATION ============
+
+        # Program: "inv<T>" - Evaluate reconstruction with noise inversion
         """
         "inv<T>" = reconstruction with noise inversion
         """
@@ -839,15 +1078,18 @@ class LitModel(pl.LightningModule):
 
                 conf = self.conf.clone()
                 # eval whole val dataset
+                # Evaluate on entire validation dataset
                 conf.eval_num_images = len(self.val_data)
                 # {'lpips', 'mse', 'ssim'}
+                # Calculate metrics with noise inversion enabled
                 score = evaluate_lpips(sampler,
                                        self.ema_model,
                                        conf,
                                        device=self.device,
                                        val_data=self.val_data,
                                        latent_sampler=None,
-                                       use_inverted_noise=True)
+                                       use_inverted_noise=True) # This enables noise inversion
+                # Log results with distinct prefix
                 for k, v in score.items():
                     self.log(f'{k}_inv_ema_T{T}', v)
 
@@ -904,20 +1146,56 @@ def train(conf: TrainConfig, gpus, nodes=1, mode: str = 'train'):
 
     # from pytorch_lightning.
 
-    plugins = []
-    if len(gpus) == 1 and nodes == 1:
-        accelerator = None
-    else:
-        accelerator = 'ddp'
-        from pytorch_lightning.plugins import DDPPlugin
+    #plugins = []
+    #if len(gpus) == 1 and nodes == 1:
+    #    accelerator = None
+    #else:
+    #    accelerator = 'ddp'
+    #    from pytorch_lightning.plugins import DDPPlugin
 
         # important for working with gradient checkpoint
-        plugins.append(DDPPlugin(find_unused_parameters=False))
+    #    plugins.append(DDPPlugin(find_unused_parameters=False))
+
+    #trainer = pl.Trainer(
+    #    max_steps=conf.total_samples // conf.batch_size_effective,
+    #    resume_from_checkpoint=resume,
+    #    gpus=gpus,
+    #    num_nodes=nodes,
+    #    accelerator=accelerator,
+    #    precision=16 if conf.fp16 else 32,
+    #    callbacks=[
+    #        checkpoint,
+    #        LearningRateMonitor(),
+    #    ],
+    #    # clip in the model instead
+    #    # gradient_clip_val=conf.grad_clip,
+    #    replace_sampler_ddp=True,
+    #    logger=tb_logger,
+    #    accumulate_grad_batches=conf.accum_batches,
+    #    plugins=plugins,
+    #)
+
+    if len(gpus) == 1 and nodes == 1:
+        accelerator = 'cuda'
+        trainer_kwargs = {}
+        plugins = None
+
+    else:
+        accelerator = 'ddp'
+        # For PyTorch Lightning 2.x
+        from pytorch_lightning.strategies import DDPStrategy
+
+        # important for working with gradient checkpoint
+        plugins = []  # Keep your existing plugins list initialization
+        trainer_kwargs = {
+            'strategy': DDPStrategy(find_unused_parameters=False)
+        }
+
+    use_dist_sampler = True if (len(gpus) >= 2 or nodes >= 2) else False
 
     trainer = pl.Trainer(
         max_steps=conf.total_samples // conf.batch_size_effective,
-        resume_from_checkpoint=resume,
-        gpus=gpus,
+        devices=gpus,
         num_nodes=nodes,
         accelerator=accelerator,
         precision=16 if conf.fp16 else 32,
@@ -925,16 +1203,28 @@ def train(conf: TrainConfig, gpus, nodes=1, mode: str = 'train'):
             checkpoint,
             LearningRateMonitor(),
         ],
-        # clip in the model instead
-        # gradient_clip_val=conf.grad_clip,
-        replace_sampler_ddp=True,
+        use_distributed_sampler=use_dist_sampler,
         logger=tb_logger,
         accumulate_grad_batches=conf.accum_batches,
-        plugins=plugins,
+        plugins=plugins if len(gpus) > 1 else None,
+        **trainer_kwargs if 'trainer_kwargs' in locals() else {},  # Add this line
     )
 
     if mode == 'train':
-        trainer.fit(model)
+
+        # Get the train dataloader from your model
+        train_loader = model.train_dataloader()
+        # If multiple loaders are returned, manually create a CombinedLoader and prime it.
+        if isinstance(train_loader, (list, dict)):
+            from pytorch_lightning.utilities.data import CombinedLoader
+
+            combined = CombinedLoader(train_loader, mode="max_size_cycle")
+            _ = iter(combined)  # This ensures internal state is set
+
+        trainer.fit(model, ckpt_path=resume)
+
+        #trainer.fit(model)
+
     elif mode == 'eval':
         # load the latest checkpoint
         # perform lpips

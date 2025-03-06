@@ -1,3 +1,7 @@
+# This script defines a configuration class `TrainConfig` for training diffusion
+# models, particularly variations of BeatGANs.
+# It uses dataclasses for configuration management and includes settings for various
+# aspects of the training process.
 import os, sys
 from typing import Tuple
 from multiprocessing import get_context
@@ -149,7 +153,7 @@ class TrainConfig(BaseConfig):
     T_sampler: str = 'uniform'
     T: int = 1_000
     total_samples: int = 10_000_000
-    warmup: int = 0
+    warmup: int = 1
     pretrain: PretrainConfig = None
     continue_from: PretrainConfig = None
     eval_programs: Tuple[str] = None

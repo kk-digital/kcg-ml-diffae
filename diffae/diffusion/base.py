@@ -68,12 +68,15 @@ class GaussianDiffusionBeatGans:
 
         self.num_timesteps = int(betas.shape[0])
 
+        # Pre-compute diffusion parameters for efficiency
+        # These follow the equations in the DDPM paper
         alphas = 1.0 - betas
         self.alphas_cumprod = np.cumprod(alphas, axis=0)
         self.alphas_cumprod_prev = np.append(1.0, self.alphas_cumprod[:-1])
         self.alphas_cumprod_next = np.append(self.alphas_cumprod[1:], 0.0)
         assert self.alphas_cumprod_prev.shape == (self.num_timesteps, )
 
+        # Additional helper constants for the forward process q(x_t | x_0)
         # calculations for diffusion q(x_t | x_{t-1}) and others
         self.sqrt_alphas_cumprod = np.sqrt(self.alphas_cumprod)
         self.sqrt_one_minus_alphas_cumprod = np.sqrt(1.0 - self.alphas_cumprod)
@@ -82,11 +85,15 @@ class GaussianDiffusionBeatGans:
         self.sqrt_recipm1_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod -
                                                    1)
 
+        # Pre-compute posterior variance (for q(x_{t-1} | x_t, x_0))
+        # σ²_t = β_t·(1-α̅_{t-1})/(1-α̅_t)
         # calculations for posterior q(x_{t-1} | x_t, x_0)
         self.posterior_variance = (betas * (1.0 - self.alphas_cumprod_prev) /
                                    (1.0 - self.alphas_cumprod))
+
         # log calculation clipped because the posterior variance is 0 at the
         # beginning of the diffusion chain.
+        # Coefficients for posterior mean calculation: μ_t = c_1·x_0 + c_2·x_t
         self.posterior_log_variance_clipped = np.log(
             np.append(self.posterior_variance[1], self.posterior_variance[1:]))
         self.posterior_mean_coef1 = (betas *
@@ -105,27 +112,35 @@ class GaussianDiffusionBeatGans:
         """
         Compute training losses for a single timestep.
 
-        :param model: the model to evaluate loss on.
-        :param x_start: the [N x C x ...] tensor of inputs.
-        :param t: a batch of timestep indices.
-        :param model_kwargs: if not None, a dict of extra keyword arguments to
-            pass to the model. This can be used for conditioning.
-        :param noise: if specified, the specific Gaussian noise to try to remove.
-        :return: a dict with the key "loss" containing a tensor of shape [N].
-                 Some mean or variance settings may also have other keys.
+        This implements the core training objective of diffusion models:
+        training the model to predict either the noise or the original data
+        from a noisy sample at a given timestep.
+
+        Args:
+            model: The model to evaluate loss on
+            x_start: The [N x C x ...] tensor of original inputs (images)
+            t: A batch of timestep indices
+            model_kwargs: Optional dict of extra arguments to pass to the model (e.g., conditioning)
+            noise: If specified, the exact noise to use for the forward process
+
+        Returns:
+            A dict with the key "loss" containing a tensor of shape [N],
+            plus other metrics depending on the model configuration
         """
         if model_kwargs is None:
             model_kwargs = {}
         if noise is None:
-            noise = th.randn_like(x_start)
+            noise = th.randn_like(x_start) # Generate random noise if not provided
 
+        # Forward diffusion: add noise to the input according to timestep t
         x_t = self.q_sample(x_start, t, noise=noise)
 
-        terms = {'x_t': x_t}
+        terms = {'x_t': x_t} # Store intermediate values for analysis
 
         if self.loss_type in [
                 LossType.mse,
-                LossType.l1,
+                LossType.l1,# Use mixed precision if configured
+                # Run the model on noisy data
         ]:
             with autocast(self.conf.fp16):
                 # x_t is static wrt. to the diffusion process
@@ -135,10 +150,12 @@ class GaussianDiffusionBeatGans:
                                               **model_kwargs)
             model_output = model_forward.pred
 
+            # Optionally detach the prediction for the loss calculation
             _model_output = model_output
             if self.conf.train_pred_xstart_detach:
                 _model_output = _model_output.detach()
-            # get the pred xstart
+
+            # Compute the predicted x_0 from the model output
             p_mean_var = self.p_mean_variance(
                 model=DummyModel(pred=_model_output),
                 # gradient goes through x_t
@@ -149,12 +166,14 @@ class GaussianDiffusionBeatGans:
 
             # model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
 
+            # Determine the target based on model_mean_type
             target_types = {
                 ModelMeanType.eps: noise,
             }
             target = target_types[self.model_mean_type]
             assert model_output.shape == target.shape == x_start.shape
 
+            # Calculate the loss between prediction and target
             if self.loss_type == LossType.mse:
                 if self.model_mean_type == ModelMeanType.eps:
                     # (n, c, h, w) => (n, )
@@ -163,10 +182,12 @@ class GaussianDiffusionBeatGans:
                     raise NotImplementedError()
             elif self.loss_type == LossType.l1:
                 # (n, c, h, w) => (n, )
+                # L1 loss (mean absolute error)
                 terms["mse"] = mean_flat((target - model_output).abs())
             else:
                 raise NotImplementedError()
 
+            # Final loss includes variational lower bound term if present
             if "vb" in terms:
                 # if learning the variance also use the vlb loss
                 terms["loss"] = terms["mse"] + terms["vb"]
@@ -187,8 +208,22 @@ class GaussianDiffusionBeatGans:
                model_kwargs=None,
                progress=False):
         """
-        Args:
-            x_start: given for the autoencoder
+            Generate samples from the model using the reverse diffusion process.
+
+            This method supports both standard DDPM sampling and faster DDIM sampling.
+
+            Args:
+                model: The model to sample from
+                shape: The shape of the samples to generate
+                noise: The starting noise, if None random noise is used
+                cond: Conditioning information (for the autoencoder)
+                x_start: Starting point for the autoencoder
+                clip_denoised: Whether to clip values to [-1, 1] during sampling
+                model_kwargs: Additional arguments to pass to the model
+                progress: Whether to display a progress bar
+
+            Returns:
+                Generated samples
         """
         if model_kwargs is None:
             model_kwargs = {}
@@ -196,7 +231,9 @@ class GaussianDiffusionBeatGans:
                 model_kwargs['x_start'] = x_start
                 model_kwargs['cond'] = cond
 
+        # Choose sampling algorithm based on configuration
         if self.conf.gen_type == GenerativeType.ddpm:
+            # Standard DDPM sampling (slower but often higher quality)
             return self.p_sample_loop(model,
                                       shape=shape,
                                       noise=noise,
@@ -204,6 +241,7 @@ class GaussianDiffusionBeatGans:
                                       model_kwargs=model_kwargs,
                                       progress=progress)
         elif self.conf.gen_type == GenerativeType.ddim:
+            # DDIM sampling (faster with fewer steps)
             return self.ddim_sample_loop(model,
                                          shape=shape,
                                          noise=noise,
@@ -215,31 +253,49 @@ class GaussianDiffusionBeatGans:
 
     def q_mean_variance(self, x_start, t):
         """
-        Get the distribution q(x_t | x_0).
+        Get the distribution q(x_t | x_0) - the forward diffusion process.
 
-        :param x_start: the [N x C x ...] tensor of noiseless inputs.
-        :param t: the number of diffusion steps (minus 1). Here, 0 means one step.
-        :return: A tuple (mean, variance, log_variance), all of x_start's shape.
+        This computes the mean and variance of the Gaussian distribution
+        that results from adding noise for t steps.
+
+        Args:
+            x_start: The [N x C x ...] tensor of noiseless inputs
+            t: The timestep indices
+
+        Returns:
+            A tuple (mean, variance, log_variance), all matching x_start's shape
         """
+        # Mean: √α̅_t · x_0
         mean = (
             _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) *
             x_start)
+
+        # Variance: 1 - α̅_t
         variance = _extract_into_tensor(1.0 - self.alphas_cumprod, t,
                                         x_start.shape)
+
+        # Log variance for numerical stability
         log_variance = _extract_into_tensor(self.log_one_minus_alphas_cumprod,
                                             t, x_start.shape)
+
         return mean, variance, log_variance
 
     def q_sample(self, x_start, t, noise=None):
         """
         Diffuse the data for a given number of diffusion steps.
 
-        In other words, sample from q(x_t | x_0).
+        Sample from q(x_t | x_0) - adds noise according to the diffusion schedule.
 
-        :param x_start: the initial data batch.
-        :param t: the number of diffusion steps (minus 1). Here, 0 means one step.
-        :param noise: if specified, the split-out normal noise.
-        :return: A noisy version of x_start.
+        The forward process follows: x_t = √α̅_t · x_0 + √(1-α̅_t) · ε
+        where ε is standard Gaussian noise.
+
+        Args:
+            x_start: The initial data batch
+            t: The timestep indices
+            noise: Optional pre-generated noise to use
+
+        Returns:
+            A noisy version of x_start (x_t)
         """
         if noise is None:
             noise = th.randn_like(x_start)
@@ -379,6 +435,10 @@ class GaussianDiffusionBeatGans:
             self.sqrt_recip_alphas_cumprod, t, scaled_xstart.shape)
 
     def _predict_eps_from_xstart(self, x_t, t, pred_xstart):
+        """
+        Args:
+            scaled_xstart: is supposed to be sqrt(alphacum) * x_0
+        """
         return (_extract_into_tensor(self.sqrt_recip_alphas_cumprod, t,
                                      x_t.shape) * x_t -
                 pred_xstart) / _extract_into_tensor(
@@ -401,13 +461,13 @@ class GaussianDiffusionBeatGans:
 
     def condition_mean(self, cond_fn, p_mean_var, x, t, model_kwargs=None):
         """
-        Compute the mean for the previous step, given a function cond_fn that
-        computes the gradient of a conditional log probability with respect to
-        x. In particular, cond_fn computes grad(log(p(y|x))), and we want to
-        condition on y.
+         Compute the mean for the previous step, given a function cond_fn that
+         computes the gradient of a conditional log probability with respect to
+         x. In particular, cond_fn computes grad(log(p(y|x))), and we want to
+         condition on y.
 
-        This uses the conditioning strategy from Sohl-Dickstein et al. (2015).
-        """
+         This uses the conditioning strategy from Sohl-Dickstein et al. (2015).
+         """
         gradient = cond_fn(x, self._scale_timesteps(t), **model_kwargs)
         new_mean = (p_mean_var["mean"].float() +
                     p_mean_var["variance"] * gradient.float())
@@ -423,14 +483,27 @@ class GaussianDiffusionBeatGans:
         Unlike condition_mean(), this instead uses the conditioning strategy
         from Song et al (2020).
         """
+
+        # Get α̅_t for the current timestep
         alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
 
+        # Calculate the predicted noise (ε) from the current predicted x_0
         eps = self._predict_eps_from_xstart(x, t, p_mean_var["pred_xstart"])
+
+        # Modify the predicted noise using the gradient from cond_fn
+        # This approach directly modifies the score function rather than the mean
+        # ε' = ε - √(1-α̅_t) · ∇x log(p(y|x))
         eps = eps - (1 - alpha_bar).sqrt() * cond_fn(
             x, self._scale_timesteps(t), **model_kwargs)
 
+        # Create a new output dictionary that updates the predicted values
         out = p_mean_var.copy()
+
+        # Recalculate x_0 using the modified noise prediction
         out["pred_xstart"] = self._predict_xstart_from_eps(x, t, eps)
+
+        # Recalculate the mean using the new x_0 prediction
+        # This ensures the modified mean is consistent with the diffusion process
         out["mean"], _, _ = self.q_posterior_mean_variance(
             x_start=out["pred_xstart"], x_t=x, t=t)
         return out
@@ -449,7 +522,7 @@ class GaussianDiffusionBeatGans:
         Sample x_{t-1} from the model at the given timestep.
 
         :param model: the model to sample from.
-        :param x: the current tensor at x_{t-1}.
+        :param x: the current tensor at x_t (not t-1 as the docstring suggests).
         :param t: the value of t, starting at 0 for the first diffusion step.
         :param clip_denoised: if True, clip the x_start prediction to [-1, 1].
         :param denoised_fn: if not None, a function which applies to the
@@ -462,6 +535,8 @@ class GaussianDiffusionBeatGans:
                  - 'sample': a random sample from the model.
                  - 'pred_xstart': a prediction of x_0.
         """
+
+        # Get the model's prediction for mean and variance of p(x_{t-1} | x_t)
         out = self.p_mean_variance(
             model,
             x,
@@ -470,15 +545,27 @@ class GaussianDiffusionBeatGans:
             denoised_fn=denoised_fn,
             model_kwargs=model_kwargs,
         )
+
+        # Generate random noise for the sampling step
         noise = th.randn_like(x)
+
+        # Create a mask that's 0 when t=0 (no noise at the final step)
+        # This ensures the final step is deterministic
         nonzero_mask = ((t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
                         )  # no noise when t == 0
+
+        # If conditional function is provided, modify the mean prediction
         if cond_fn is not None:
             out["mean"] = self.condition_mean(cond_fn,
                                               out,
                                               x,
                                               t,
                                               model_kwargs=model_kwargs)
+
+        # Sample from the predicted Gaussian distribution
+        # x_{t-1} ~ N(μ, σ²I) where:
+        # - μ is the (possibly conditioned) mean
+        # - σ² is the predicted variance (via log_variance)
         sample = out["mean"] + nonzero_mask * th.exp(
             0.5 * out["log_variance"]) * noise
         return {"sample": sample, "pred_xstart": out["pred_xstart"]}
@@ -497,6 +584,9 @@ class GaussianDiffusionBeatGans:
     ):
         """
         Generate samples from the model.
+
+        This is the main sampling function that orchestrates the entire denoising process.
+        It returns only the final denoised sample, discarding intermediate results.
 
         :param model: the model module.
         :param shape: the shape of the samples, (N, C, H, W).
@@ -526,7 +616,9 @@ class GaussianDiffusionBeatGans:
                 device=device,
                 progress=progress,
         ):
-            final = sample
+            final = sample  # Each iteration overwrites final, so we'll end with the last sample
+
+        # Return only the final sample image, not the dictionary with other info
         return final["sample"]
 
     def p_sample_loop_progressive(
@@ -545,40 +637,58 @@ class GaussianDiffusionBeatGans:
         Generate samples from the model and yield intermediate samples from
         each timestep of diffusion.
 
+        This is a generator function that implements the reverse diffusion process:
+        It starts with pure noise (x_T) and progressively denoises it step by step
+        until reaching x_0 (the clean image).
+
         Arguments are the same as p_sample_loop().
         Returns a generator over dicts, where each dict is the return value of
         p_sample().
         """
+        # Determine the device to use for sampling
         if device is None:
             device = next(model.parameters()).device
+
+        # Start with provided noise or generate random noise
         if noise is not None:
-            img = noise
+            img = noise # Use provided noise as starting point
         else:
+            # Start with pure Gaussian noise (x_T ~ N(0,1))
             assert isinstance(shape, (tuple, list))
             img = th.randn(*shape, device=device)
-        indices = list(range(self.num_timesteps))[::-1]
 
+        # Create reverse timestep schedule (T-1, T-2, ..., 1, 0)
+        indices = list(range(self.num_timesteps))[::-1] # Reverse order for denoising
+
+        # Add progress bar if requested
         if progress:
             # Lazy import so that we don't depend on tqdm.
             from tqdm.auto import tqdm
 
             indices = tqdm(indices)
 
+        # Iterate through timesteps in reverse order (denoising process)
         for i in indices:
+            # Create a batch of identical timestep values
             # t = th.tensor([i] * shape[0], device=device)
             t = th.tensor([i] * len(img), device=device)
+            # No gradient computation needed during sampling
             with th.no_grad():
+                # Apply a single denoising step to get x_{t-1} from x_t
                 out = self.p_sample(
                     model,
-                    img,
-                    t,
+                    img,# Current noisy image x_t
+                    t, # Current timestep
                     clip_denoised=clip_denoised,
                     denoised_fn=denoised_fn,
-                    cond_fn=cond_fn,
+                    cond_fn=cond_fn,# Optional conditioning function
                     model_kwargs=model_kwargs,
                 )
+                # Yield the current sample (and other info) to the caller
                 yield out
-                img = out["sample"]
+
+                # Update the image to the new sample for the next iteration
+                img = out["sample"]# x_{t-1} becomes the new x_t for next step
 
     def ddim_sample(
         self,
@@ -589,13 +699,17 @@ class GaussianDiffusionBeatGans:
         denoised_fn=None,
         cond_fn=None,
         model_kwargs=None,
-        eta=0.0,
+        eta=0.0, # Controls the stochasticity (0=deterministic, 1=same as DDPM)
     ):
         """
         Sample x_{t-1} from the model using DDIM.
 
-        Same usage as p_sample().
+        DDIM (Denoising Diffusion Implicit Models) is an alternative sampling strategy
+        that allows for fewer sampling steps through a more deterministic process.
+        The eta parameter controls how stochastic the process is.
         """
+
+        # Get model predictions for mean, variance, and x_0
         out = self.p_mean_variance(
             model,
             x,
@@ -604,6 +718,8 @@ class GaussianDiffusionBeatGans:
             denoised_fn=denoised_fn,
             model_kwargs=model_kwargs,
         )
+
+        # If conditioning function is provided, use score-based conditioning
         if cond_fn is not None:
             out = self.condition_score(cond_fn,
                                        out,
@@ -611,21 +727,34 @@ class GaussianDiffusionBeatGans:
                                        t,
                                        model_kwargs=model_kwargs)
 
-        # Usually our model outputs epsilon, but we re-derive it
-        # in case we used x_start or x_prev prediction.
+        # Re-derive epsilon (noise) from predicted x_0 for consistency
+        # This is important for DDIM's deterministic formulation
         eps = self._predict_eps_from_xstart(x, t, out["pred_xstart"])
 
+        # Extract alpha values for current and previous timesteps
         alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
         alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod_prev, t,
                                               x.shape)
+
+        # Calculate sigma (noise scale) based on eta parameter
+        # eta=0 means deterministic (DDIM), eta=1 means same noise level as DDPM
         sigma = (eta * th.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar)) *
                  th.sqrt(1 - alpha_bar / alpha_bar_prev))
-        # Equation 12.
+
+        # Calculate the mean prediction according to DDIM's formula (Equation 12)
+        # This combines:
+        # 1. The predicted x_0 component: x_0 * √(α̅_{t-1})
+        # 2. The direction component: ε * √(1 - α̅_{t-1} - σ²)
         noise = th.randn_like(x)
         mean_pred = (out["pred_xstart"] * th.sqrt(alpha_bar_prev) +
                      th.sqrt(1 - alpha_bar_prev - sigma**2) * eps)
+
+        # Create mask that's 0 for t=0 (to avoid adding noise at the final step)
         nonzero_mask = ((t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
                         )  # no noise when t == 0
+
+        # Final sample combines deterministic component and stochastic component
+        # x_{t-1} = mean_pred + σ * noise
         sample = mean_pred + nonzero_mask * sigma * noise
         return {"sample": sample, "pred_xstart": out["pred_xstart"]}
 
@@ -849,14 +978,14 @@ class GaussianDiffusionBeatGans:
 
     def _prior_bpd(self, x_start):
         """
-        Get the prior KL term for the variational lower-bound, measured in
-        bits-per-dim.
+         Get the prior KL term for the variational lower-bound, measured in
+         bits-per-dim.
 
-        This term can't be optimized, as it only depends on the encoder.
+         This term can't be optimized, as it only depends on the encoder.
 
-        :param x_start: the [N x C x ...] tensor of inputs.
-        :return: a batch of [N] KL values (in bits), one per batch element.
-        """
+         :param x_start: the [N x C x ...] tensor of inputs.
+         :return: a batch of [N] KL values (in bits), one per batch element.
+         """
         batch_size = x_start.shape[0]
         t = th.tensor([self.num_timesteps - 1] * batch_size,
                       device=x_start.device)

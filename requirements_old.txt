@@ -1,0 +1,29 @@
+# Updated requirements file for DiffAE
+# This file contains requirements that work with current Python versions (3.8-3.11)
+
+
+# Core ML libraries
+pytorch-lightning==1.4.5
+torchmetrics==0.5.0
+torch==1.8.1
+torchvision
+
+# Scientific computing
+scipy==1.5.4
+numpy==1.19.5
+
+# Data processing and utilities
+tqdm
+pandas==1.1.5
+lmdb==1.2.1
+ftfy
+regex
+
+# Image processing and metrics
+pytorch-fid==0.2.0
+lpips==0.1.4
+
+# Optional - for CUDA support, uncomment and specify your CUDA version
+# If you have CUDA, install PyTorch with the appropriate CUDA version using:
+# pip install torch torchvision --extra-index-url https://download.pytorch.org/whl/cu118
+# (Replace cu118 with your CUDA version, e.g., cu117, cu116, etc.)

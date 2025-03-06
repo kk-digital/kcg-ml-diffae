@@ -20,7 +20,7 @@ from diffae.model.nn import mean_flat
 class RandomImageDataset(Dataset):
     """ Generates random images for testing purposes. Replace with actual dataset. """
 
-    def __init__(self, num_images=1000, image_size=256):
+    def __init__(self, num_images=1000, image_size=2):
         self.num_images = num_images
         self.image_size = image_size
         self.transform = transforms.Compose([
@@ -43,10 +43,10 @@ class DiffAETrainingPipeline:
 
         # Load Model Configuration
         self.conf = config
-        self.batch_size = self.conf.batch_size
-        self.num_epochs = 10
+        self.batch_size = 2
+        self.num_epochs = 2
         self.gradient_accumulation_steps = 1
-        self.max_train_steps = 10000  # Adjust based on dataset
+        self.max_train_steps = 7  # Adjust based on dataset
 
         # Model Initialization
         self.model = LitModel(self.conf).to(self.device, dtype=self.dtype)
@@ -107,10 +107,11 @@ class DiffAETrainingPipeline:
 
             if step % self.gradient_accumulation_steps == 0:
                 if hasattr(self.model, 'on_before_optimizer_step'):
-                    self.model.on_before_optimizer_step(self.optim, 0)
+                    #self.model.on_before_optimizer_step(self.optim, 0)
+                    self.model.on_before_optimizer_step(self.optim)
                 self.optim.step()
                 self.sched.step()
-                ema(self.model.model._orig_mod, self.ema_model, self.conf.ema_decay)
+                ema(self.model.model, self.ema_model, self.conf.ema_decay)
 
             if step % 1000 == 0:  # Save checkpoint every 1000 steps
                 torch.save(self.model.state_dict(), f"checkpoint_step{step}.pth")
@@ -122,6 +123,9 @@ class DiffAETrainingPipeline:
 
 
 if __name__ == "__main__":
+    print('Started')
     conf = ffhq256_autoenc()  # Load the default DiffAE config
+    print('Started 2')
     pipeline = DiffAETrainingPipeline(conf)
+    print('Started 3')
     pipeline.train()
